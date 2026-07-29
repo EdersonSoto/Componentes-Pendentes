@@ -3,19 +3,34 @@ Painel de Pendencias - Compras de Componentes Eletronicos (Soto Company)
 
 Programa de mesa (nao e pagina de internet): interface nativa em Tkinter,
 dados gravados localmente em SQLite. Nao precisa de instalacao nem de conexao
-com a internet para funcionar. Para copiar o banco para uma pasta do Google
-Drive/OneDrive como backup, use o botao "Backup agora" na barra de ferramentas.
+com a internet para funcionar no dia a dia. Para copiar o banco para uma
+pasta local (ex.: uma pasta sincronizada do Google Drive/OneDrive) como
+backup, use o botao "Backup agora" na barra de ferramentas.
+
+Tambem e possivel enviar o backup direto para o Google Drive via API, sem
+depender do cliente de sincronizacao instalado (botao "Nuvem (Google
+Drive)") — util para manter duas instalacoes do programa, em PCs
+diferentes, atualizadas uma com a outra. Veja as instrucoes de configuracao
+no comentario acima da secao "Backup na nuvem (Google Drive)".
 
 Como iniciar: clique duas vezes em "Iniciar Painel.bat" (ou rode `python app.py`).
 """
 
 import calendar
+import hashlib
+import os
 import re
+import secrets
 import shutil
+import smtplib
 import sqlite3
+import string
+import sys
+import tempfile
 import threading
 import tkinter as tk
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from urllib.parse import urlparse
@@ -29,15 +44,41 @@ try:
 except ImportError:
     BANDEJA_DISPONIVEL = False
 
+try:
+    from google.auth.transport.requests import Request as GoogleAuthRequest
+    from google.oauth2.credentials import Credentials as GoogleCredentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build as google_build
+    from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+    GOOGLE_DRIVE_DISPONIVEL = True
+except ImportError:
+    GOOGLE_DRIVE_DISPONIVEL = False
+
 # --------------------------------------------------------------------------
 # Caminhos e constantes
 # --------------------------------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parent
+# Quando empacotado com PyInstaller (sys.frozen), __file__ aponta para dentro
+# do bundle, entao a pasta base precisa ser a do executavel para dados,
+# config e credenciais ficarem gravados ao lado do .exe (nao dentro do
+# bundle interno, que pode ser reescrito a cada atualizacao do programa).
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+    RECURSOS_DIR = Path(getattr(sys, "_MEIPASS", BASE_DIR))
+else:
+    BASE_DIR = Path(__file__).resolve().parent
+    RECURSOS_DIR = BASE_DIR
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "componentes.db"
 CONFIG_PATH = BASE_DIR / "config.json"
 DATA_DIR.mkdir(exist_ok=True)
+
+ICON_PATH = RECURSOS_DIR / "assets" / "icon.ico"
+
+CREDENTIALS_PATH = BASE_DIR / "credentials.json"
+TOKEN_PATH = DATA_DIR / "token_drive.json"
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+DRIVE_FOLDER_NOME = "Painel de Pendencias - Backups"
 
 ATTENTION_WINDOW_DAYS = 3  # janela (dias) para o indicador amarelo de "atencao"
 
@@ -49,6 +90,14 @@ DIAS_SEMANA_PT = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
 
 # --------------------------------------------------------------------------
 # Paleta de cores (tema unico, claro, acento petroleo/verde-azulado)
+#
+# As cores de status usam a paleta Okabe-Ito (segura para daltonismo): em
+# vez do tradicional vermelho/amarelo/verde — que fica ambiguo para quem
+# tem protanopia/deuteranopia (dificuldade em distinguir vermelho e verde,
+# o tipo mais comum) — o "bom/no prazo" usa AZUL em vez de verde, o que
+# mantem contraste solido com o vermelho para qualquer tipo de daltonismo.
+# Cada status tambem tem um simbolo proprio (nao so a cor), reforcando a
+# leitura por forma alem de cor.
 # --------------------------------------------------------------------------
 
 COR = {
@@ -61,16 +110,18 @@ COR = {
     "acento": "#0E7A88",
     "acento_escuro": "#0B5F6A",
     "acento_tint": "#DCEEEF",
-    "verde": "#1E8E5A",
-    "verde_tint": "#E1F3E9",
-    "amarelo": "#B8790A",
+    "verde": "#0B6FB0",
+    "verde_tint": "#E1EDF9",
+    "amarelo": "#D98E00",
     "amarelo_tint": "#FBEEDA",
-    "vermelho": "#C13B2E",
+    "vermelho": "#C1272D",
     "vermelho_tint": "#FBE4E1",
-    "laranja": "#8A5A00",
+    "laranja": "#7A4B00",
     "laranja_tint": "#F1E6D2",
     "cinza": "#6B7678",
     "cinza_tint": "#E7EBEB",
+    "selecao": "#5B3A9E",
+    "selecao_tint": "#EAE3F5",
 }
 
 FONTE_TITULO = ("Segoe UI Semibold", 17)
@@ -81,6 +132,14 @@ FONTE_KPI_VALOR = ("Segoe UI Semibold", 20)
 FONTE_KPI_ROTULO = ("Segoe UI", 9)
 FONTE_DADOS = ("Consolas", 10)
 FONTE_DADOS_HEAD = ("Segoe UI Semibold", 9)
+
+
+def aplicar_icone_janela(janela):
+    if ICON_PATH.exists():
+        try:
+            janela.iconbitmap(str(ICON_PATH))
+        except tk.TclError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -140,6 +199,45 @@ def init_db():
         )
         """
     )
+
+    colunas_pedidos = {row["name"] for row in conn.execute("PRAGMA table_info(pedidos)")}
+    if "criado_por" not in colunas_pedidos:
+        conn.execute("ALTER TABLE pedidos ADD COLUMN criado_por TEXT")
+    if "atualizado_por" not in colunas_pedidos:
+        conn.execute("ALTER TABLE pedidos ADD COLUMN atualizado_por TEXT")
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome_usuario TEXT NOT NULL UNIQUE,
+            nome_completo TEXT,
+            senha_hash TEXT NOT NULL,
+            senha_salt TEXT NOT NULL,
+            criado_em TEXT NOT NULL
+        )
+        """
+    )
+
+    colunas_usuarios = {row["name"] for row in conn.execute("PRAGMA table_info(usuarios)")}
+    if "is_admin" not in colunas_usuarios:
+        conn.execute("ALTER TABLE usuarios ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
+        primeiro = conn.execute("SELECT id FROM usuarios ORDER BY id LIMIT 1").fetchone()
+        if primeiro:
+            conn.execute("UPDATE usuarios SET is_admin = 1 WHERE id = ?", (primeiro["id"],))
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS historico (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pedido_id INTEGER,
+            acao TEXT NOT NULL,
+            usuario TEXT NOT NULL,
+            descricao TEXT,
+            quando TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -176,23 +274,25 @@ def compute_indicador(row, hoje=None):
     chegada = parse_date(row["data_chegada"])
 
     if row["cancelado"]:
-        return {"cor": "cinza", "rotulo": "Cancelado", "grupo": "cancelado", "simbolo": "○"}
+        return {"cor": "cinza", "rotulo": "Cancelado", "grupo": "cancelado", "simbolo": "⊘", "dias": 0}
 
     if chegada:
         if previsao and chegada > previsao:
-            return {"cor": "laranja", "rotulo": "Entregue com atraso", "grupo": "entregue", "simbolo": "◐"}
-        return {"cor": "verde", "rotulo": "Entregue no prazo", "grupo": "entregue", "simbolo": "●"}
+            return {"cor": "laranja", "rotulo": "Entregue com atraso", "grupo": "entregue", "simbolo": "◐",
+                    "dias": (chegada - previsao).days}
+        return {"cor": "verde", "rotulo": "Entregue no prazo", "grupo": "entregue", "simbolo": "✔", "dias": 0}
 
     if not previsao:
-        return {"cor": "cinza", "rotulo": "Sem previsão", "grupo": "pendente", "simbolo": "○"}
+        return {"cor": "cinza", "rotulo": "Sem previsão", "grupo": "pendente", "simbolo": "○", "dias": 0}
 
     dias_restantes = (previsao - hoje).days
     if dias_restantes < 0:
-        return {"cor": "vermelho", "rotulo": f"Atrasado ({-dias_restantes}d)", "grupo": "pendente", "simbolo": "●"}
+        return {"cor": "vermelho", "rotulo": f"Atrasado ({-dias_restantes}d)", "grupo": "pendente", "simbolo": "▲",
+                "dias": dias_restantes}
     if dias_restantes <= ATTENTION_WINDOW_DAYS:
         rotulo = "Chega hoje" if dias_restantes == 0 else f"Atenção ({dias_restantes}d)"
-        return {"cor": "amarelo", "rotulo": rotulo, "grupo": "pendente", "simbolo": "●"}
-    return {"cor": "verde", "rotulo": "No prazo", "grupo": "pendente", "simbolo": "●"}
+        return {"cor": "amarelo", "rotulo": rotulo, "grupo": "pendente", "simbolo": "◆", "dias": dias_restantes}
+    return {"cor": "verde", "rotulo": "No prazo", "grupo": "pendente", "simbolo": "●", "dias": dias_restantes}
 
 
 def carregar_pedidos():
@@ -216,6 +316,134 @@ def carregar_pedidos():
 
 class ValidationError(Exception):
     pass
+
+
+# --------------------------------------------------------------------------
+# Usuarios (login / cadastro)
+# --------------------------------------------------------------------------
+
+def _hash_senha(senha, salt=None):
+    salt = salt or os.urandom(16)
+    hash_ = hashlib.pbkdf2_hmac("sha256", senha.encode("utf-8"), salt, 200_000)
+    return salt.hex(), hash_.hex()
+
+
+def criar_usuario(nome_usuario, senha, nome_completo=""):
+    nome_usuario = nome_usuario.strip()
+    if not nome_usuario:
+        raise ValidationError("Informe um nome de usuário.")
+    if len(senha) < 4:
+        raise ValidationError("A senha deve ter pelo menos 4 caracteres.")
+
+    conn = get_conn()
+    existente = conn.execute(
+        "SELECT id FROM usuarios WHERE nome_usuario = ? COLLATE NOCASE", (nome_usuario,)
+    ).fetchone()
+    if existente:
+        conn.close()
+        raise ValidationError("Já existe um usuário cadastrado com esse nome.")
+
+    eh_primeiro_usuario = conn.execute("SELECT COUNT(*) AS c FROM usuarios").fetchone()["c"] == 0
+    salt_hex, hash_hex = _hash_senha(senha)
+    conn.execute(
+        """
+        INSERT INTO usuarios (nome_usuario, nome_completo, senha_hash, senha_salt, criado_em, is_admin)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (nome_usuario, nome_completo.strip(), hash_hex, salt_hex,
+         datetime.now().isoformat(timespec="seconds"), 1 if eh_primeiro_usuario else 0),
+    )
+    conn.commit()
+    conn.close()
+
+
+def autenticar_usuario(nome_usuario, senha):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM usuarios WHERE nome_usuario = ? COLLATE NOCASE", (nome_usuario.strip(),)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    _, hash_calculado = _hash_senha(senha, bytes.fromhex(row["senha_salt"]))
+    if hash_calculado != row["senha_hash"]:
+        return None
+    return {
+        "id": row["id"], "nome_usuario": row["nome_usuario"], "nome_completo": row["nome_completo"],
+        "is_admin": bool(row["is_admin"]),
+    }
+
+
+# --------------------------------------------------------------------------
+# Codigo de autorizacao por e-mail (controle de quem pode se cadastrar)
+# --------------------------------------------------------------------------
+#
+# O codigo e enviado automaticamente pelo proprio programa (SMTP, em
+# segundo plano) direto para sototechnologycompany@gmail.com — quem esta
+# se cadastrando NUNCA ve o codigo na tela, so o administrador (dono
+# daquela caixa de entrada). Por isso precisa de uma conta remetente com
+# "senha de app" do Gmail configurada em config.json:
+#   "email_smtp_remetente": "conta@gmail.com"
+#   "email_smtp_senha_app": "senha de app de 16 caracteres (nao a senha normal)"
+# Gere a senha de app em myaccount.google.com/apppasswords (exige
+# verificacao em duas etapas ativada na conta remetente).
+
+EMAIL_AUTORIZACAO_DESTINO = "sototechnologycompany@gmail.com"
+CODIGO_AUTORIZACAO_VALIDADE_MINUTOS = 15
+
+
+def gerar_codigo_autorizacao():
+    alfabeto = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alfabeto) for _ in range(8))
+
+
+def enviar_codigo_autorizacao(codigo, nome_usuario_solicitado):
+    cfg = load_config()
+    remetente = cfg.get("email_smtp_remetente")
+    senha_app = cfg.get("email_smtp_senha_app")
+    if not remetente or not senha_app:
+        raise ValidationError(
+            "Envio de e-mail não configurado. Abra o arquivo \"config.json\" (na pasta do "
+            "programa) e preencha \"email_smtp_remetente\" e \"email_smtp_senha_app\" "
+            "(uma senha de app do Gmail, não a senha normal)."
+        )
+
+    mensagem = EmailMessage()
+    mensagem["Subject"] = f"Código de autorização — {nome_usuario_solicitado}"
+    mensagem["From"] = remetente
+    mensagem["To"] = EMAIL_AUTORIZACAO_DESTINO
+    mensagem.set_content(
+        f"Solicitação de cadastro no Painel de Pendências.\n\n"
+        f"Usuário solicitado: {nome_usuario_solicitado}\n"
+        f"Código de autorização: {codigo}\n\n"
+        f"Válido por {CODIGO_AUTORIZACAO_VALIDADE_MINUTOS} minutos.\n"
+        "Repasse esse código para a pessoa por outro meio (telefone, WhatsApp etc.) "
+        "para autorizar o cadastro."
+    )
+
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+        smtp.login(remetente, senha_app)
+        smtp.send_message(mensagem)
+
+
+# --------------------------------------------------------------------------
+# Historico (quem alterou o que)
+# --------------------------------------------------------------------------
+
+def registrar_historico(conn, pedido_id, acao, usuario, descricao):
+    conn.execute(
+        "INSERT INTO historico (pedido_id, acao, usuario, descricao, quando) VALUES (?, ?, ?, ?, ?)",
+        (pedido_id, acao, usuario or "—", descricao, datetime.now().isoformat(timespec="seconds")),
+    )
+
+
+def carregar_historico(limite=500):
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM historico ORDER BY quando DESC, id DESC LIMIT ?", (limite,)
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
 
 
 def validar_payload(payload):
@@ -259,29 +487,33 @@ def validar_payload(payload):
     }
 
 
-def inserir_pedido(payload):
+def inserir_pedido(payload, usuario):
     agora = datetime.now().isoformat(timespec="seconds")
     conn = get_conn()
-    conn.execute(
+    cursor = conn.execute(
         """
         INSERT INTO pedidos
             (fornecedor, numero_pedido, componente, quantidade, valor,
              data_pedido, data_compra, previsao_entrega, data_chegada,
-             cancelado, observacoes, criado_em, atualizado_em)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             cancelado, observacoes, criado_em, atualizado_em, criado_por, atualizado_por)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             payload["fornecedor"], payload["numero_pedido"], payload["componente"],
             payload["quantidade"], payload["valor"], payload["data_pedido"],
             payload["data_compra"], payload["previsao_entrega"], payload["data_chegada"],
-            payload["cancelado"], payload["observacoes"], agora, agora,
+            payload["cancelado"], payload["observacoes"], agora, agora, usuario, usuario,
         ),
+    )
+    registrar_historico(
+        conn, cursor.lastrowid, "criado", usuario,
+        f"{payload['componente']} — {payload['fornecedor']}",
     )
     conn.commit()
     conn.close()
 
 
-def atualizar_pedido(pedido_id, payload):
+def atualizar_pedido(pedido_id, payload, usuario):
     agora = datetime.now().isoformat(timespec="seconds")
     conn = get_conn()
     conn.execute(
@@ -289,23 +521,33 @@ def atualizar_pedido(pedido_id, payload):
         UPDATE pedidos SET
             fornecedor=?, numero_pedido=?, componente=?, quantidade=?, valor=?,
             data_pedido=?, data_compra=?, previsao_entrega=?, data_chegada=?,
-            cancelado=?, observacoes=?, atualizado_em=?
+            cancelado=?, observacoes=?, atualizado_em=?, atualizado_por=?
         WHERE id=?
         """,
         (
             payload["fornecedor"], payload["numero_pedido"], payload["componente"],
             payload["quantidade"], payload["valor"], payload["data_pedido"],
             payload["data_compra"], payload["previsao_entrega"], payload["data_chegada"],
-            payload["cancelado"], payload["observacoes"], agora, pedido_id,
+            payload["cancelado"], payload["observacoes"], agora, usuario, pedido_id,
         ),
+    )
+    registrar_historico(
+        conn, pedido_id, "editado", usuario,
+        f"{payload['componente']} — {payload['fornecedor']}",
     )
     conn.commit()
     conn.close()
 
 
-def excluir_pedido(pedido_id):
+def excluir_pedido(pedido_id, usuario):
     conn = get_conn()
+    pedido = conn.execute("SELECT fornecedor, componente FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
     conn.execute("DELETE FROM pedidos WHERE id = ?", (pedido_id,))
+    if pedido:
+        registrar_historico(
+            conn, pedido_id, "excluído", usuario,
+            f"{pedido['componente']} — {pedido['fornecedor']}",
+        )
     conn.commit()
     conn.close()
 
@@ -328,6 +570,211 @@ def fazer_backup(pasta_destino):
     return str(destino)
 
 
+def criar_copia_temp_do_banco():
+    conn = get_conn()
+    conn.execute("PRAGMA wal_checkpoint(FULL)")
+    conn.close()
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    tmp = Path(tempfile.gettempdir()) / f"componentes_backup_{timestamp}.db"
+    shutil.copy2(DB_PATH, tmp)
+    return tmp
+
+
+# --------------------------------------------------------------------------
+# Backup na nuvem (Google Drive)
+# --------------------------------------------------------------------------
+#
+# Usa a API oficial do Google Drive (nao depende do app "Google Drive para
+# Desktop" estar instalado/sincronizado). Escopo minimo "drive.file": o
+# programa so enxerga a pasta de backup que ele mesmo cria, nada mais do
+# Drive do usuario. Para funcionar, e preciso um arquivo "credentials.json"
+# (OAuth Client tipo "Desktop app", criado gratuitamente em
+# https://console.cloud.google.com/apis/credentials) salvo ao lado do
+# app.py. O mesmo credentials.json deve ser copiado para os outros PCs; cada
+# PC autoriza a propria conta Google uma vez (botao "Conectar conta Google"),
+# e o token fica salvo em data/token_drive.json.
+
+
+class DriveError(Exception):
+    pass
+
+
+def drive_conta_conectada():
+    """Checagem rapida (sem rede) se ja existe um token salvo neste PC."""
+    return GOOGLE_DRIVE_DISPONIVEL and TOKEN_PATH.exists()
+
+
+def _obter_credenciais_existentes():
+    if not TOKEN_PATH.exists():
+        return None
+    creds = GoogleCredentials.from_authorized_user_file(str(TOKEN_PATH), DRIVE_SCOPES)
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(GoogleAuthRequest())
+        TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+    return creds if creds and creds.valid else None
+
+
+def conectar_conta_google():
+    """Fluxo interativo: abre o navegador para o usuario autorizar. So deve
+    ser chamado a partir de uma acao explicita do usuario (botao Conectar)."""
+    if not CREDENTIALS_PATH.exists():
+        raise DriveError(
+            "Arquivo \"credentials.json\" não encontrado ao lado do app.py.\n\n"
+            "Crie um OAuth Client (tipo \"Desktop app\") gratuito em "
+            "console.cloud.google.com/apis/credentials, baixe o JSON e salve "
+            "com o nome \"credentials.json\" nesta pasta. Copie o mesmo arquivo "
+            "para os outros PCs onde o programa for usado."
+        )
+    flow = InstalledAppFlow.from_client_secrets_file(str(CREDENTIALS_PATH), DRIVE_SCOPES)
+    creds = flow.run_local_server(port=0)
+    TOKEN_PATH.write_text(creds.to_json(), encoding="utf-8")
+    return creds
+
+
+def _obter_servico_drive(interativo=False):
+    if not GOOGLE_DRIVE_DISPONIVEL:
+        raise DriveError(
+            "As bibliotecas do Google Drive não estão instaladas. Rode:\n"
+            "pip install google-auth google-auth-oauthlib google-api-python-client"
+        )
+    creds = _obter_credenciais_existentes()
+    if not creds:
+        if not interativo:
+            raise DriveError("Conta Google ainda não conectada.")
+        creds = conectar_conta_google()
+    return google_build("drive", "v3", credentials=creds, cache_discovery=False)
+
+
+def _obter_ou_criar_pasta_drive(servico, cfg):
+    folder_id = cfg.get("drive_folder_id")
+    if folder_id:
+        try:
+            info = servico.files().get(fileId=folder_id, fields="id, trashed").execute()
+            if not info.get("trashed"):
+                return folder_id
+        except Exception:
+            pass  # pasta nao existe mais / sem acesso: procura/recria abaixo
+
+    # Procura por nome antes de criar uma pasta nova. Isso permite que outro PC,
+    # conectando com a MESMA conta Google mas sem o config.json local (drive_folder_id),
+    # encontre a pasta que ja existe em vez de criar uma segunda vazia.
+    resposta = servico.files().list(
+        q=f"name='{DRIVE_FOLDER_NOME}' and mimeType='application/vnd.google-apps.folder' and trashed=false",
+        fields="files(id)",
+        pageSize=1,
+    ).execute()
+    encontrados = resposta.get("files", [])
+    if encontrados:
+        folder_id = encontrados[0]["id"]
+        cfg["drive_folder_id"] = folder_id
+        save_config(cfg)
+        return folder_id
+
+    resultado = servico.files().create(
+        body={"name": DRIVE_FOLDER_NOME, "mimeType": "application/vnd.google-apps.folder"},
+        fields="id",
+    ).execute()
+    folder_id = resultado["id"]
+    cfg["drive_folder_id"] = folder_id
+    save_config(cfg)
+    return folder_id
+
+
+def enviar_backup_para_drive(caminho_arquivo, interativo=False):
+    """Envia um arquivo de backup para a pasta do app no Google Drive.
+    Retorna o modifiedTime (ISO) do arquivo criado."""
+    servico = _obter_servico_drive(interativo=interativo)
+    cfg = load_config()
+    folder_id = _obter_ou_criar_pasta_drive(servico, cfg)
+    media = MediaFileUpload(str(caminho_arquivo), mimetype="application/octet-stream", resumable=False)
+    arquivo = servico.files().create(
+        body={"name": Path(caminho_arquivo).name, "parents": [folder_id]},
+        media_body=media,
+        fields="id, modifiedTime",
+    ).execute()
+    cfg = load_config()
+    cfg["drive_ultimo_modificado_conhecido"] = arquivo["modifiedTime"]
+    save_config(cfg)
+    return arquivo["modifiedTime"]
+
+
+def buscar_ultimo_backup_na_nuvem(interativo=False):
+    servico = _obter_servico_drive(interativo=interativo)
+    cfg = load_config()
+    folder_id = _obter_ou_criar_pasta_drive(servico, cfg)
+    resposta = servico.files().list(
+        q=f"'{folder_id}' in parents and trashed=false",
+        orderBy="modifiedTime desc",
+        pageSize=1,
+        fields="files(id, name, modifiedTime)",
+    ).execute()
+    arquivos = resposta.get("files", [])
+    return (servico, arquivos[0]) if arquivos else (servico, None)
+
+
+def baixar_backup_da_nuvem(servico, file_id, destino):
+    request = servico.files().get_media(fileId=file_id)
+    with open(destino, "wb") as f:
+        downloader = MediaIoBaseDownload(f, request)
+        concluido = False
+        while not concluido:
+            _status, concluido = downloader.next_chunk()
+    return destino
+
+
+def sincronizar_com_a_nuvem_ao_iniciar():
+    """Chamado uma vez ao abrir o programa (so em segundo plano, sem abrir
+    navegador). Se ja existir no Drive um backup mais novo do que o ultimo
+    que este PC conhece (ou seja, um backup feito em outro PC), baixa e
+    substitui o banco local, guardando uma copia de seguranca do banco
+    anterior. Retorna uma mensagem para exibir ao usuario, ou None."""
+    if not drive_conta_conectada():
+        return None
+    try:
+        cfg = load_config()
+        servico, arquivo = buscar_ultimo_backup_na_nuvem(interativo=False)
+        if not arquivo:
+            return None
+        conhecido = cfg.get("drive_ultimo_modificado_conhecido") or ""
+        if arquivo["modifiedTime"] <= conhecido:
+            return None
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        copia_seguranca = DATA_DIR / f"componentes_pre_sync_{timestamp}.db"
+        conn = get_conn()
+        conn.execute("PRAGMA wal_checkpoint(FULL)")
+        conn.close()
+        shutil.copy2(DB_PATH, copia_seguranca)
+
+        baixar_backup_da_nuvem(servico, arquivo["id"], DB_PATH)
+
+        cfg["drive_ultimo_modificado_conhecido"] = arquivo["modifiedTime"]
+        save_config(cfg)
+        return (
+            "Uma versão mais recente do banco foi encontrada no Google Drive "
+            "(feita em outro PC) e foi baixada automaticamente.\n\n"
+            f"A versão anterior deste PC foi guardada em:\n{copia_seguranca}"
+        )
+    except Exception:
+        return None
+
+
+def sincronizar_com_a_nuvem_ao_sair():
+    """Chamado ao fechar o programa (so em segundo plano, sem abrir
+    navegador). Envia uma copia atual do banco para o Drive, se ja houver
+    uma conta conectada."""
+    if not drive_conta_conectada():
+        return
+    try:
+        tmp = criar_copia_temp_do_banco()
+        try:
+            enviar_backup_para_drive(tmp, interativo=False)
+        finally:
+            tmp.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 # --------------------------------------------------------------------------
 # Formatacao
 # --------------------------------------------------------------------------
@@ -341,6 +788,30 @@ def formatar_moeda(valor):
 def formatar_data_br(iso):
     d = parse_date(iso)
     return d.strftime("%d/%m/%Y") if d else "—"
+
+
+def formatar_data_hora_local(iso):
+    """Formata um timestamp local (ex.: datetime.now().isoformat(), sem fuso)
+    salvo no banco para 'dd/mm/aaaa HH:MM'."""
+    if not iso:
+        return "—"
+    try:
+        return datetime.fromisoformat(iso).strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        return "—"
+
+
+def formatar_data_hora_iso(iso):
+    """Formata um timestamp ISO 8601 (ex.: retornado pela API do Google Drive,
+    '2026-07-29T12:34:56.000Z') para 'dd/mm/aaaa HH:MM' em horario local."""
+    if not iso:
+        return "—"
+    try:
+        texto = iso.replace("Z", "+00:00")
+        momento = datetime.fromisoformat(texto).astimezone()
+        return momento.strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        return "—"
 
 
 # --------------------------------------------------------------------------
@@ -540,9 +1011,10 @@ def anexar_seletor_data(parent, botao, entry_var):
 # --------------------------------------------------------------------------
 
 class DialogoPedido(tk.Toplevel):
-    def __init__(self, parent, ao_salvar, pedido=None):
+    def __init__(self, parent, ao_salvar, usuario, pedido=None):
         super().__init__(parent)
         self.ao_salvar = ao_salvar
+        self.usuario = usuario
         self.pedido = pedido
         self.title("Editar pedido" if pedido else "Novo pedido")
         self.configure(bg=COR["surface"])
@@ -596,7 +1068,21 @@ class DialogoPedido(tk.Toplevel):
         btn.pack(side="left", padx=(4, 0))
         anexar_seletor_data(self, btn, self.vars[chave])
 
+    def _texto_autoria(self):
+        partes = []
+        if self.pedido.get("criado_por"):
+            partes.append(f"Criado por {self.pedido['criado_por']}")
+        if self.pedido.get("atualizado_por") and self.pedido.get("atualizado_por") != self.pedido.get("criado_por"):
+            partes.append(f"última alteração por {self.pedido['atualizado_por']}")
+        return " • ".join(partes)
+
     def _construir_formulario(self):
+        if self.pedido and (self.pedido.get("criado_por") or self.pedido.get("atualizado_por")):
+            tk.Label(
+                self, text=self._texto_autoria(), font=("Segoe UI", 8),
+                bg=COR["surface"], fg=COR["ink_fraco"],
+            ).pack(anchor="w", padx=20, pady=(10, 0))
+
         pad = tk.Frame(self, bg=COR["surface"], padx=20, pady=18)
         pad.pack(fill="both", expand=True)
 
@@ -667,9 +1153,16 @@ class DialogoPedido(tk.Toplevel):
             return
 
         if self.pedido:
-            atualizar_pedido(self.pedido["id"], dados)
+            atualizar_pedido(self.pedido["id"], dados, self.usuario)
         else:
-            inserir_pedido(dados)
+            if not messagebox.askyesno(
+                "Confirmar cadastro",
+                f"Cadastrar o pedido de \"{dados['componente']}\" ({dados['fornecedor']})?",
+                parent=self,
+            ):
+                return
+            inserir_pedido(dados, self.usuario)
+            threading.Thread(target=sincronizar_com_a_nuvem_ao_sair, daemon=True).start()
         self.destroy()
         self.ao_salvar()
 
@@ -699,9 +1192,10 @@ class QuadroRolavel(tk.Frame):
 # --------------------------------------------------------------------------
 
 class DialogoImportarEmail(tk.Toplevel):
-    def __init__(self, parent, ao_salvar):
+    def __init__(self, parent, ao_salvar, usuario):
         super().__init__(parent)
         self.ao_salvar = ao_salvar
+        self.usuario = usuario
         self.cards = []
         self.title("Importar pedido de e-mail")
         self.configure(bg=COR["surface"])
@@ -852,7 +1346,7 @@ class DialogoImportarEmail(tk.Toplevel):
             }
             try:
                 dados = validar_payload(payload)
-                inserir_pedido(dados)
+                inserir_pedido(dados, self.usuario)
                 importados += 1
             except ValidationError as exc:
                 erros.append(f"{v['componente'].get() or '(sem código)'}: {exc}")
@@ -868,8 +1362,350 @@ class DialogoImportarEmail(tk.Toplevel):
                 "Importação concluída", f"{importados} pedido(s) importado(s) com sucesso.", parent=self
             )
 
+        if importados:
+            threading.Thread(target=sincronizar_com_a_nuvem_ao_sair, daemon=True).start()
+
         self.destroy()
         self.ao_salvar()
+
+
+# --------------------------------------------------------------------------
+# Dialogo de configuracao do backup na nuvem (Google Drive)
+# --------------------------------------------------------------------------
+
+class DialogoDrive(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Backup na nuvem (Google Drive)")
+        self.configure(bg=COR["surface"])
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self._construir()
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _construir(self):
+        pad = tk.Frame(self, bg=COR["surface"], padx=20, pady=18)
+        pad.pack(fill="both", expand=True)
+
+        tk.Label(pad, text="Backup na nuvem (Google Drive)", font=FONTE_TITULO,
+                 bg=COR["surface"], fg=COR["ink"]).pack(anchor="w")
+        tk.Label(
+            pad, text="Depois de conectar, o programa baixa automaticamente a versão\n"
+                      "mais nova ao abrir (se ela tiver vindo de outro PC) e envia uma\n"
+                      "cópia para o Drive sempre que você fizer um backup ou fechar o programa.",
+            font=FONTE_BASE, bg=COR["surface"], fg=COR["ink_muted"], justify="left",
+        ).pack(anchor="w", pady=(4, 14))
+
+        self.lbl_status = tk.Label(pad, text="", font=FONTE_BASE_NEG, bg=COR["surface"])
+        self.lbl_status.pack(anchor="w")
+        self.lbl_detalhe = tk.Label(pad, text="", font=FONTE_BASE, bg=COR["surface"], fg=COR["ink_muted"],
+                                     justify="left")
+        self.lbl_detalhe.pack(anchor="w", pady=(2, 16))
+
+        botoes = tk.Frame(pad, bg=COR["surface"])
+        botoes.pack(fill="x")
+        tk.Button(
+            botoes, text="Fechar", command=self.destroy, bd=0, padx=16, pady=7,
+            bg=COR["bg"], fg=COR["ink_muted"], font=FONTE_BASE, cursor="hand2",
+        ).pack(side="right")
+        self.btn_conectar = tk.Button(
+            botoes, text="Conectar conta Google", command=self._conectar, bd=0, padx=16, pady=7,
+            bg=COR["acento"], fg="white", font=FONTE_BASE_NEG, cursor="hand2",
+            activebackground=COR["acento_escuro"],
+        )
+        self.btn_conectar.pack(side="right", padx=(0, 8))
+
+        self._atualizar_status()
+
+    def _atualizar_status(self):
+        if not GOOGLE_DRIVE_DISPONIVEL:
+            self.lbl_status.configure(text="Bibliotecas do Google Drive não instaladas", fg=COR["vermelho"])
+            self.lbl_detalhe.configure(
+                text="Rode: pip install google-auth google-auth-oauthlib google-api-python-client"
+            )
+            self.btn_conectar.configure(state="disabled")
+            return
+
+        if drive_conta_conectada():
+            cfg = load_config()
+            ultimo = cfg.get("drive_ultimo_modificado_conhecido")
+            self.lbl_status.configure(text="Conectado", fg=COR["verde"])
+            self.lbl_detalhe.configure(
+                text=("Último backup sincronizado: " + formatar_data_hora_iso(ultimo)) if ultimo
+                else "Ainda sem backups na nuvem. Clique em \"Backup agora\" para enviar o primeiro."
+            )
+            self.btn_conectar.configure(text="Reconectar / trocar conta")
+        elif CREDENTIALS_PATH.exists():
+            self.lbl_status.configure(text="Não conectado", fg=COR["amarelo"])
+            self.lbl_detalhe.configure(text="Clique em \"Conectar conta Google\" e autorize no navegador.")
+            self.btn_conectar.configure(text="Conectar conta Google")
+        else:
+            self.lbl_status.configure(text="Não configurado", fg=COR["amarelo"])
+            self.lbl_detalhe.configure(
+                text="Falta o arquivo \"credentials.json\" ao lado do app.py.\n"
+                     "Crie um OAuth Client (tipo Desktop app) gratuito em\n"
+                     "console.cloud.google.com/apis/credentials e salve-o com esse nome."
+            )
+            self.btn_conectar.configure(text="Conectar conta Google")
+
+    def _conectar(self):
+        self.btn_conectar.configure(state="disabled", text="Abrindo navegador...")
+
+        def tarefa():
+            erro = None
+            mensagem_sync = None
+            try:
+                conectar_conta_google()
+                # Logo apos conectar, ja verifica se existe um backup mais novo
+                # na pasta do Drive (ex.: feito em outro PC) e baixa na hora,
+                # sem precisar fechar e reabrir o programa.
+                mensagem_sync = sincronizar_com_a_nuvem_ao_iniciar()
+            except Exception as exc:
+                erro = str(exc)
+            self.after(0, lambda: self._apos_conectar(erro, mensagem_sync))
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _apos_conectar(self, erro, mensagem_sync=None):
+        self.btn_conectar.configure(state="normal")
+        if erro:
+            messagebox.showwarning("Não foi possível conectar", erro, parent=self)
+        elif mensagem_sync:
+            self.master.atualizar_dados()
+            messagebox.showinfo("Conectado", mensagem_sync, parent=self)
+        else:
+            messagebox.showinfo("Conectado", "Conta Google conectada com sucesso.", parent=self)
+        self._atualizar_status()
+
+
+# --------------------------------------------------------------------------
+# Dialogo de historico (quem alterou o que)
+# --------------------------------------------------------------------------
+
+class DialogoHistorico(tk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Histórico de alterações")
+        self.configure(bg=COR["surface"])
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self._construir()
+        self.bind("<Escape>", lambda e: self.destroy())
+
+    def _construir(self):
+        pad = tk.Frame(self, bg=COR["surface"], padx=20, pady=18)
+        pad.pack(fill="both", expand=True)
+
+        tk.Label(pad, text="Histórico de alterações", font=FONTE_TITULO,
+                 bg=COR["surface"], fg=COR["ink"]).pack(anchor="w")
+        tk.Label(
+            pad, text="Últimos registros de quem criou, editou ou excluiu cada pedido.",
+            font=FONTE_BASE, bg=COR["surface"], fg=COR["ink_muted"],
+        ).pack(anchor="w", pady=(2, 12))
+
+        quadro = QuadroRolavel(pad, altura=380, bg=COR["surface"])
+        quadro.pack(fill="both", expand=True)
+
+        registros = carregar_historico()
+        if not registros:
+            tk.Label(quadro.interior, text="Nenhuma alteração registrada ainda.",
+                     font=FONTE_BASE, bg=COR["surface"], fg=COR["ink_muted"]).pack(anchor="w", pady=8)
+        else:
+            for reg in registros:
+                linha = tk.Frame(quadro.interior, bg=COR["surface"], highlightbackground=COR["borda"],
+                                  highlightthickness=1, padx=10, pady=6)
+                linha.pack(fill="x", pady=2, padx=2)
+                tk.Label(
+                    linha, text=f"{formatar_data_hora_local(reg['quando'])}  •  {reg['usuario']}  •  {reg['acao']}",
+                    font=FONTE_BASE_NEG, bg=COR["surface"], fg=COR["ink"],
+                ).pack(anchor="w")
+                if reg["descricao"]:
+                    tk.Label(linha, text=reg["descricao"], font=FONTE_BASE,
+                             bg=COR["surface"], fg=COR["ink_muted"]).pack(anchor="w")
+
+        tk.Button(
+            pad, text="Fechar", command=self.destroy, bd=0, padx=16, pady=7,
+            bg=COR["bg"], fg=COR["ink_muted"], font=FONTE_BASE, cursor="hand2",
+        ).pack(anchor="e", pady=(14, 0))
+
+
+# --------------------------------------------------------------------------
+# Tela de login / cadastro
+# --------------------------------------------------------------------------
+
+class TelaLogin(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.usuario_autenticado = None
+        self.title("Entrar — Painel de Pendências")
+        self.configure(bg=COR["borda"])
+        self.resizable(False, False)
+        aplicar_icone_janela(self)
+        self.modo_cadastro = False
+        self.codigo_pendente = None
+        self.codigo_gerado_em = None
+
+        self.var_usuario = tk.StringVar()
+        self.var_senha = tk.StringVar()
+        self.var_nome_completo = tk.StringVar()
+        self.var_confirmar = tk.StringVar()
+        self.var_codigo = tk.StringVar()
+
+        self.pad = tk.Frame(self, bg=COR["surface"], padx=28, pady=24)
+        self.pad.pack(padx=1, pady=1)
+        self._redesenhar()
+        self.bind("<Return>", lambda e: self._confirmar())
+
+    def _centralizar(self):
+        self.update_idletasks()
+        largura = self.winfo_reqwidth()
+        altura = self.winfo_reqheight()
+        x = (self.winfo_screenwidth() - largura) // 2
+        y = (self.winfo_screenheight() - altura) // 2
+        self.geometry(f"{largura}x{altura}+{x}+{y}")
+
+    def _campo(self, rotulo, var, mostrar=None):
+        tk.Label(self.pad, text=rotulo, font=FONTE_BASE, bg=COR["surface"], fg=COR["ink_muted"]).pack(
+            anchor="w", pady=(8, 2)
+        )
+        entry = ttk.Entry(self.pad, textvariable=var, width=30, font=FONTE_BASE, show=mostrar or "")
+        entry.pack(fill="x")
+        return entry
+
+    def _redesenhar(self):
+        for w in self.pad.winfo_children():
+            w.destroy()
+
+        tk.Label(self.pad, text="Painel de Pendências", font=FONTE_TITULO,
+                 bg=COR["surface"], fg=COR["ink"]).pack(anchor="w")
+        tk.Label(self.pad, text="Soto Company", font=FONTE_BASE,
+                 bg=COR["surface"], fg=COR["ink_muted"]).pack(anchor="center", fill="x", pady=(0, 14))
+
+        self._campo("Usuário", self.var_usuario)
+        self._campo("Senha", self.var_senha, mostrar="*")
+
+        tk.Button(
+            self.pad, text="Entrar", command=self._entrar, bd=0, padx=16, pady=8,
+            bg=COR["acento"], fg="white", font=FONTE_BASE_NEG, cursor="hand2",
+            activebackground=COR["acento_escuro"],
+        ).pack(fill="x", pady=(16, 0))
+
+        if self.modo_cadastro:
+            self._campo("Nome completo", self.var_nome_completo)
+            self._campo("Confirmar senha", self.var_confirmar, mostrar="*")
+            self._campo_codigo()
+            tk.Button(
+                self.pad, text="Criar conta", command=self._cadastrar, bd=0, padx=16, pady=8,
+                bg=COR["verde"], fg="white", font=FONTE_BASE_NEG, cursor="hand2",
+            ).pack(fill="x", pady=(12, 0))
+            link = tk.Label(
+                self.pad, text="Voltar", font=FONTE_BASE, bg=COR["surface"], fg=COR["acento"], cursor="hand2",
+            )
+            link.pack(anchor="center", pady=(10, 0))
+            link.bind("<Button-1>", lambda e: self._selecionar_aba(False))
+        else:
+            link = tk.Label(
+                self.pad, text="Cadastrar", font=FONTE_BASE, bg=COR["surface"], fg=COR["acento"], cursor="hand2",
+            )
+            link.pack(anchor="center", pady=(14, 0))
+            link.bind("<Button-1>", lambda e: self._selecionar_aba(True))
+
+        self._centralizar()
+
+    def _campo_codigo(self):
+        tk.Label(self.pad, text="Código de autorização", font=FONTE_BASE, bg=COR["surface"],
+                 fg=COR["ink_muted"]).pack(anchor="w", pady=(8, 2))
+        linha = tk.Frame(self.pad, bg=COR["surface"])
+        linha.pack(fill="x")
+        ttk.Entry(linha, textvariable=self.var_codigo, width=16, font=FONTE_DADOS).pack(side="left")
+        tk.Button(
+            linha, text="Enviar código", command=self._enviar_codigo, bd=0, padx=10, pady=4,
+            bg=COR["acento_tint"], fg=COR["acento_escuro"], font=("Segoe UI", 9), cursor="hand2",
+        ).pack(side="left", padx=(8, 0))
+        tk.Label(
+            self.pad, text="Peça para o administrador conferir o e-mail e informar o código.",
+            font=("Segoe UI", 8), bg=COR["surface"], fg=COR["ink_fraco"],
+        ).pack(anchor="w", pady=(2, 0))
+
+    def _selecionar_aba(self, cadastro):
+        if self.modo_cadastro == cadastro:
+            return
+        self.modo_cadastro = cadastro
+        self._redesenhar()
+
+    def _enviar_codigo(self):
+        nome = self.var_usuario.get().strip()
+        if not nome:
+            messagebox.showwarning(
+                "Informe o usuário", "Preencha o campo \"Usuário\" antes de enviar o código.", parent=self
+            )
+            return
+        codigo = gerar_codigo_autorizacao()
+        try:
+            enviar_codigo_autorizacao(codigo, nome)
+        except Exception as exc:
+            messagebox.showerror("Não foi possível enviar o código", str(exc), parent=self)
+            return
+        self.codigo_pendente = codigo
+        self.codigo_gerado_em = datetime.now()
+        messagebox.showinfo(
+            "Código enviado",
+            f"O código foi enviado para {EMAIL_AUTORIZACAO_DESTINO}.\n\nPeça o código para o "
+            "administrador e cole no campo abaixo.",
+            parent=self,
+        )
+
+    def _confirmar(self):
+        if self.modo_cadastro:
+            self._cadastrar()
+        else:
+            self._entrar()
+
+    def _entrar(self):
+        nome = self.var_usuario.get().strip()
+        senha = self.var_senha.get()
+        if not nome or not senha:
+            messagebox.showwarning("Preencha os campos", "Informe usuário e senha.", parent=self)
+            return
+        usuario = autenticar_usuario(nome, senha)
+        if not usuario:
+            messagebox.showerror("Login inválido", "Usuário ou senha incorretos.", parent=self)
+            return
+        self.usuario_autenticado = usuario
+        self.destroy()
+
+    def _cadastrar(self):
+        nome = self.var_usuario.get().strip()
+        senha = self.var_senha.get()
+        if senha != self.var_confirmar.get():
+            messagebox.showwarning("Senhas diferentes", "A senha e a confirmação não são iguais.", parent=self)
+            return
+
+        if not self.codigo_pendente:
+            messagebox.showwarning(
+                "Envie o código primeiro",
+                "Clique em \"Enviar código\" e cole o código recebido por e-mail.",
+                parent=self,
+            )
+            return
+        if datetime.now() - self.codigo_gerado_em > timedelta(minutes=CODIGO_AUTORIZACAO_VALIDADE_MINUTOS):
+            messagebox.showwarning(
+                "Código expirado", "O código expirou. Clique em \"Enviar código\" novamente.", parent=self
+            )
+            return
+        if self.var_codigo.get().strip().upper() != self.codigo_pendente:
+            messagebox.showerror("Código incorreto", "O código informado não confere.", parent=self)
+            return
+
+        try:
+            criar_usuario(nome, senha, self.var_nome_completo.get())
+        except ValidationError as exc:
+            messagebox.showwarning("Não foi possível cadastrar", str(exc), parent=self)
+            return
+        self.usuario_autenticado = autenticar_usuario(nome, senha)
+        self.destroy()
 
 
 # --------------------------------------------------------------------------
@@ -887,16 +1723,20 @@ FILTROS = [
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, usuario_atual):
         super().__init__()
+        self.usuario_atual = usuario_atual
         self.title("Painel de Pendências — Compras de Componentes Eletrônicos")
         self.configure(bg=COR["bg"])
+        aplicar_icone_janela(self)
         self.geometry("1220x720")
         self.minsize(1040, 600)
+        self.state("zoomed")
 
         self.filtro_ativo = tk.StringVar(value="todos")
         self.busca = tk.StringVar()
         self.busca.trace_add("write", lambda *_: self._renderizar_tabela())
+        self.marcados = set()
 
         self._configurar_estilos()
         self._montar_topo()
@@ -911,13 +1751,15 @@ class App(tk.Tk):
         self.icone_bandeja = None
         self._configurar_bandeja()
         self.atualizar_dados()
+        self._sincronizar_nuvem_ao_iniciar()
+        self._backup_automatico_ao_iniciar()
 
     # -- bandeja do sistema (perto do relogio) -----------------------------
 
     def _configurar_bandeja(self):
         if not BANDEJA_DISPONIVEL:
             # pystray/Pillow nao instalados: fecha a janela normalmente encerra o programa.
-            self.protocol("WM_DELETE_WINDOW", self.destroy)
+            self.protocol("WM_DELETE_WINDOW", self._encerrar_app)
             return
 
         self.protocol("WM_DELETE_WINDOW", self._minimizar_para_bandeja)
@@ -948,6 +1790,10 @@ class App(tk.Tk):
     def _sair_de_vez(self):
         if self.icone_bandeja is not None:
             self.icone_bandeja.stop()
+        self._encerrar_app()
+
+    def _encerrar_app(self):
+        sincronizar_com_a_nuvem_ao_sair()
         self.destroy()
 
     def _atualizar_icone_bandeja(self, atrasados, atencao):
@@ -975,8 +1821,11 @@ class App(tk.Tk):
         style.configure("Treeview.Heading", background=COR["bg"], foreground=COR["ink_muted"],
                          font=FONTE_DADOS_HEAD, borderwidth=0, relief="flat")
         style.map("Treeview.Heading", background=[("active", COR["acento_tint"])])
-        style.map("Treeview", background=[("selected", COR["acento_tint"])],
-                  foreground=[("selected", COR["ink"])])
+        # O estado nativo "selected" do ttk sobrepoe qualquer cor definida via
+        # tag (a tag de status da linha some quando ela e selecionada), entao
+        # a cor de selecao precisa ser configurada aqui, nao so via tag.
+        style.map("Treeview", background=[("selected", COR["selecao"])],
+                  foreground=[("selected", "white")])
         style.layout("Treeview", [("Treeview.treearea", {"sticky": "nswe"})])
 
         style.configure("TEntry", fieldbackground="white", padding=5)
@@ -992,13 +1841,21 @@ class App(tk.Tk):
         esquerda.pack(side="left")
         tk.Label(esquerda, text="Painel de Pendências", font=FONTE_TITULO,
                  bg=COR["bg"], fg=COR["ink"]).pack(anchor="w")
-        tk.Label(esquerda, text="Compras de componentes eletrônicos — Soto Company",
+        nome_exibido = self.usuario_atual.get("nome_completo") or self.usuario_atual["nome_usuario"]
+        tk.Label(esquerda, text=f"Compras de componentes eletrônicos — Soto Company  •  Logado como {nome_exibido}",
                  font=FONTE_BASE, bg=COR["bg"], fg=COR["ink_muted"]).pack(anchor="w")
 
         direita = tk.Frame(topo, bg=COR["bg"])
         direita.pack(side="right")
-        self._botao_secundario(direita, "Escolher pasta de backup", self._escolher_pasta).pack(side="left", padx=(0, 8))
-        self._botao_secundario(direita, "Backup agora", self._fazer_backup).pack(side="left")
+        if self.usuario_atual.get("is_admin"):
+            self._botao_secundario(direita, "Escolher pasta de backup", self._escolher_pasta).pack(
+                side="left", padx=(0, 8)
+            )
+            self._botao_secundario(direita, "Backup agora", self._fazer_backup).pack(side="left", padx=(0, 8))
+            self._botao_secundario(direita, "Nuvem (Google Drive)", self._abrir_config_drive).pack(
+                side="left", padx=(0, 8)
+            )
+            self._botao_secundario(direita, "Histórico", self._abrir_historico).pack(side="left")
 
     def _botao_secundario(self, mestre, texto, comando):
         return tk.Button(
@@ -1081,22 +1938,30 @@ class App(tk.Tk):
         container = tk.Frame(self, bg=COR["bg"])
         container.pack(fill="both", expand=True, padx=24, pady=(0, 8))
 
-        colunas = ("status", "fornecedor", "componente", "numero_pedido", "quantidade",
-                   "valor", "data_pedido", "data_compra", "previsao_entrega", "data_chegada")
+        self.pode_excluir = bool(self.usuario_atual.get("is_admin"))
+
+        colunas = (("marcar",) if self.pode_excluir else ()) + (
+            "status", "fornecedor", "componente", "numero_pedido", "quantidade",
+            "valor", "data_pedido", "data_compra", "previsao_entrega", "data_chegada",
+        )
         titulos = {
-            "status": "Status", "fornecedor": "Fornecedor", "componente": "Componente",
+            "marcar": "", "status": "Status", "fornecedor": "Fornecedor", "componente": "Componente",
             "numero_pedido": "Nº Pedido", "quantidade": "Qtd", "valor": "Valor (R$)",
             "data_pedido": "Data Pedido", "data_compra": "Data Compra",
             "previsao_entrega": "Previsão", "data_chegada": "Chegada",
         }
         larguras = {
-            "status": 170, "fornecedor": 150, "componente": 190, "numero_pedido": 100,
+            "marcar": 34, "status": 170, "fornecedor": 150, "componente": 190, "numero_pedido": 100,
             "quantidade": 60, "valor": 110, "data_pedido": 95, "data_compra": 95,
             "previsao_entrega": 95, "data_chegada": 95,
         }
 
         self.tree = ttk.Treeview(container, columns=colunas, show="headings", selectmode="browse")
         for col in colunas:
+            if col == "marcar":
+                self.tree.heading(col, text="")
+                self.tree.column(col, width=larguras[col], anchor="center", stretch=False)
+                continue
             ancora = "e" if col in ("quantidade", "valor") else "w"
             self.tree.heading(col, text=titulos[col], command=lambda c=col: self._ordenar_por(c))
             self.tree.column(col, width=larguras[col], anchor=ancora)
@@ -1116,21 +1981,24 @@ class App(tk.Tk):
             self.tree.tag_configure(cor_chave, background=cor_fundo)
             self.tree.tag_configure(f"{cor_chave}_status", foreground=cor_texto)
 
-        # tag "selecionado" fica por ultimo na tupla de tags de cada linha, entao
-        # ganha prioridade sobre a cor de status e o clique fica sempre visivel.
-        self.tree.tag_configure("selecionado", background=COR["acento"], foreground="white")
-
         self.tree.bind("<Double-1>", lambda e: self._abrir_editar())
-        self.tree.bind("<<TreeviewSelect>>", self._ao_selecionar_linha)
+        self.tree.bind("<Button-1>", self._ao_clicar_tabela, add="+")
 
         acoes = tk.Frame(self, bg=COR["bg"])
         acoes.pack(fill="x", padx=24, pady=(0, 4))
         self._botao_secundario(acoes, "Editar selecionado", self._abrir_editar).pack(side="left")
-        self._botao_secundario(acoes, "Excluir selecionado", self._excluir_selecionado).pack(side="left", padx=8)
+        if self.pode_excluir:
+            self._botao_secundario(acoes, "Excluir marcados", self._excluir_marcados).pack(side="left", padx=8)
 
     def _montar_rodape(self):
-        self.rodape_lbl = tk.Label(self, text="", font=FONTE_BASE, bg=COR["bg"], fg=COR["ink_fraco"])
-        self.rodape_lbl.pack(fill="x", padx=24, pady=(0, 14), anchor="w")
+        rodape = tk.Frame(self, bg=COR["bg"])
+        rodape.pack(fill="x", padx=24, pady=(0, 14))
+        self.rodape_lbl = tk.Label(rodape, text="", font=FONTE_BASE, bg=COR["bg"], fg=COR["ink_fraco"])
+        self.rodape_lbl.pack(anchor="w")
+        self.status_backup_lbl = tk.Label(
+            rodape, text="", font=("Segoe UI", 8), bg=COR["bg"], fg=COR["verde"]
+        )
+        self.status_backup_lbl.pack(anchor="w")
 
     # -- dados / renderizacao ----------------------------------------------
 
@@ -1182,33 +2050,47 @@ class App(tk.Tk):
             pedidos = self._ordenar_lista(pedidos, self.ordenar_coluna_atual, self.ordenar_reverso)
         else:
             ordem_severidade = {"vermelho": 0, "amarelo": 1, "laranja": 2, "verde": 3, "cinza": 4}
-            pedidos.sort(key=lambda p: ordem_severidade.get(p["indicador"]["cor"], 9))
+            pedidos.sort(key=lambda p: (ordem_severidade.get(p["indicador"]["cor"], 9), p["indicador"]["dias"]))
 
         for p in pedidos:
             ind = p["indicador"]
-            valores = (
+            valores = []
+            if self.pode_excluir:
+                valores.append("☑" if p["id"] in self.marcados else "☐")
+            valores.extend((
                 f"{ind['simbolo']}  {ind['rotulo']}",
                 p["fornecedor"], p["componente"], p["numero_pedido"] or "—",
                 p["quantidade"], formatar_moeda(p["valor"]),
                 formatar_data_br(p["data_pedido"]), formatar_data_br(p["data_compra"]),
                 formatar_data_br(p["previsao_entrega"]), formatar_data_br(p["data_chegada"]),
-            )
-            self.tree.insert("", "end", iid=str(p["id"]), values=valores, tags=(ind["cor"],))
-
-    def _ao_selecionar_linha(self, _evento=None):
-        for item in self.tree.get_children():
-            tags = list(self.tree.item(item, "tags"))
-            if "selecionado" in tags:
-                self.tree.item(item, tags=[t for t in tags if t != "selecionado"])
-        for item in self.tree.selection():
-            tags = list(self.tree.item(item, "tags"))
-            self.tree.item(item, tags=tags + ["selecionado"])
+            ))
+            self.tree.insert("", "end", iid=str(p["id"]), values=tuple(valores), tags=(ind["cor"],))
 
         total = len(pedidos)
-        self.rodape_lbl.configure(
-            text=f"{total} pedido(s) exibido(s) de {len(self.pedidos)} no total  •  "
-                 f"clique duas vezes numa linha para editar"
+        rodape = (
+            f"{total} pedido(s) exibido(s) de {len(self.pedidos)} no total  •  "
+            f"clique duas vezes numa linha para editar"
         )
+        if self.marcados:
+            rodape += f"  •  {len(self.marcados)} marcado(s) para excluir"
+        self.rodape_lbl.configure(text=rodape)
+
+    def _ao_clicar_tabela(self, evento):
+        if not self.pode_excluir:
+            return
+        if self.tree.identify_region(evento.x, evento.y) != "cell":
+            return
+        if self.tree.identify_column(evento.x) != "#1":  # coluna "marcar"
+            return
+        item = self.tree.identify_row(evento.y)
+        if not item:
+            return
+        pedido_id = int(item)
+        if pedido_id in self.marcados:
+            self.marcados.discard(pedido_id)
+        else:
+            self.marcados.add(pedido_id)
+        self._renderizar_tabela()
 
     def _ordenar_por(self, coluna):
         if self.ordenar_coluna_atual == coluna:
@@ -1243,25 +2125,46 @@ class App(tk.Tk):
         return next((p for p in self.pedidos if p["id"] == pedido_id), None)
 
     def _abrir_novo(self):
-        DialogoPedido(self, ao_salvar=self.atualizar_dados)
+        DialogoPedido(self, ao_salvar=self.atualizar_dados, usuario=self.usuario_atual["nome_usuario"])
 
     def _abrir_importar_email(self):
-        DialogoImportarEmail(self, ao_salvar=self.atualizar_dados)
+        DialogoImportarEmail(self, ao_salvar=self.atualizar_dados, usuario=self.usuario_atual["nome_usuario"])
 
     def _abrir_editar(self):
         pedido = self._pedido_selecionado()
         if pedido:
-            DialogoPedido(self, ao_salvar=self.atualizar_dados, pedido=pedido)
+            DialogoPedido(
+                self, ao_salvar=self.atualizar_dados, usuario=self.usuario_atual["nome_usuario"], pedido=pedido
+            )
 
-    def _excluir_selecionado(self):
-        pedido = self._pedido_selecionado()
-        if not pedido:
+    def _abrir_historico(self):
+        if not self.usuario_atual.get("is_admin"):
             return
+        DialogoHistorico(self)
+
+    def _excluir_marcados(self):
+        if not self.pode_excluir:
+            return
+        if not self.marcados:
+            messagebox.showinfo(
+                "Nenhum pedido marcado",
+                "Marque a caixinha (☐) na frente das linhas que deseja excluir.",
+            )
+            return
+
+        marcados = [p for p in self.pedidos if p["id"] in self.marcados]
+        linhas = "\n".join(f"- {p['componente']} ({p['fornecedor']})" for p in marcados[:10])
+        if len(marcados) > 10:
+            linhas += f"\n… e mais {len(marcados) - 10}"
+
         if messagebox.askyesno(
-            "Excluir pedido",
-            f"Excluir o pedido de \"{pedido['componente']}\" ({pedido['fornecedor']})?\nEsta ação não pode ser desfeita.",
+            "Excluir pedidos marcados",
+            f"Excluir {len(marcados)} pedido(s)?\n\n{linhas}\n\nEsta ação não pode ser desfeita.",
         ):
-            excluir_pedido(pedido["id"])
+            for p in marcados:
+                excluir_pedido(p["id"], self.usuario_atual["nome_usuario"])
+                self.marcados.discard(p["id"])
+            threading.Thread(target=sincronizar_com_a_nuvem_ao_sair, daemon=True).start()
             self.atualizar_dados()
 
     # -- backup ------------------------------------------------------------
@@ -1283,10 +2186,66 @@ class App(tk.Tk):
             return
         messagebox.showinfo("Backup concluído", f"Arquivo salvo em:\n{destino}")
 
+        if drive_conta_conectada():
+            threading.Thread(target=lambda: enviar_backup_para_drive(destino), daemon=True).start()
+
+    def _backup_automatico_ao_iniciar(self):
+        cfg = load_config()
+        pasta = cfg.get("pasta_backup")
+        if not pasta:
+            self._mostrar_status_backup(False)
+            return
+
+        def tarefa():
+            try:
+                destino = fazer_backup(pasta)
+            except ValidationError:
+                self.after(0, lambda: self._mostrar_status_backup(False))
+                return
+            if drive_conta_conectada():
+                try:
+                    enviar_backup_para_drive(destino)
+                except Exception:
+                    pass
+            self.after(0, lambda: self._mostrar_status_backup(True))
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _mostrar_status_backup(self, sucesso):
+        agora = datetime.now().strftime("%H:%M")
+        if sucesso:
+            self.status_backup_lbl.configure(text=f"✔ Backup OK — {agora}", fg=COR["verde"])
+        else:
+            self.status_backup_lbl.configure(text=f"✖ Backup não realizado — {agora}", fg=COR["vermelho"])
+
+    def _abrir_config_drive(self):
+        if not self.usuario_atual.get("is_admin"):
+            return
+        DialogoDrive(self)
+
+    def _sincronizar_nuvem_ao_iniciar(self):
+        def tarefa():
+            mensagem = sincronizar_com_a_nuvem_ao_iniciar()
+            if mensagem:
+                self.after(0, lambda: self._apos_sincronizar_ao_iniciar(mensagem))
+
+        threading.Thread(target=tarefa, daemon=True).start()
+
+    def _apos_sincronizar_ao_iniciar(self, mensagem):
+        self.atualizar_dados()
+        messagebox.showinfo("Sincronizado com o Google Drive", mensagem)
+
 
 def main():
     init_db()
-    app = App()
+
+    login = TelaLogin()
+    login.mainloop()
+    usuario = login.usuario_autenticado
+    if not usuario:
+        return
+
+    app = App(usuario_atual=usuario)
     app.mainloop()
 
 

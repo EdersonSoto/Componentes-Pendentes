@@ -6,3 +6,20 @@ __pycache__/
 venv/
 .env
 *.log
+
+# Segredos do backup na nuvem (Google Drive): nunca versionar
+credentials.json
+data/token_drive.json
+config.json
+data/*.db
+para-outro-pc/
+
+# Artefatos de build (PyInstaller / Inno Setup): gerados, nao versionar
+build/
+dist/
+installer_output/
+*.spec
+
+# Backups locais e config de ferramentas: nao fazem parte do codigo do app
+Backup/
+.claude/
