@@ -3,17 +3,19 @@
 ; Como gerar o instalador:
 ;   1) Empacotar o app com PyInstaller (gera a pasta "dist\Painel de Pendencias"):
 ;      python -m PyInstaller --noconfirm --windowed --name "Painel de Pendencias" ^
-;          --icon "assets/icon.ico" --add-data "assets/icon.ico;assets" app.py
+;          --icon "assets/icon.ico" --add-data "assets/icon.ico;assets" ^
+;          --hidden-import psycopg2 app.py
 ;   2) Compilar este script com o Inno Setup (ISCC.exe instalador.iss), ou abrir
 ;      no Inno Setup Compiler e clicar em "Compile".
 ;
-; O instalador NAO inclui data\, config.json, credentials.json nem token_drive.json
-; (sao gerados/configurados a cada instalacao). Instala numa pasta por usuario
-; (AppData\Local), sem precisar de permissao de administrador, ja que o proprio
-; programa grava banco de dados e configuracoes ao lado do executavel.
+; O instalador JA inclui o config.json (com a connection string do banco
+; Supabase) — o programa fica pronto pra usar assim que instala, sem
+; nenhum passo manual. Cuidado: quem tiver esse instalador tem acesso a
+; senha do banco, entao nao distribua fora da empresa. Instala numa pasta
+; por usuario (AppData\Local), sem precisar de permissao de administrador.
 
-#define MyAppName "Painel de Pendencias"
-#define MyAppVersion "1.0.0"
+#define MyAppName "Painel de Pendencias v2"
+#define MyAppVersion "2.0.0"
 #define MyAppPublisher "Soto Company"
 #define MyAppExeName "Painel de Pendencias.exe"
 
@@ -43,6 +45,9 @@ Name: "desktopicon"; Description: "Criar um atalho na área de trabalho"; GroupD
 
 [Files]
 Source: "dist\Painel de Pendencias\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; So copia se ainda nao existir config.json ali — uma reinstalacao/atualizacao
+; nao sobrescreve uma configuracao que a pessoa ja tenha ajustado na mao.
+Source: "config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
