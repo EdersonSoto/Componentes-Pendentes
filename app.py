@@ -53,6 +53,12 @@ try:
 except ImportError:
     psycopg2 = None
 
+try:
+    from PIL import Image as _ImagemPIL, ImageTk as _ImagemTk
+    PIL_DISPONIVEL = True
+except ImportError:
+    PIL_DISPONIVEL = False
+
 # --------------------------------------------------------------------------
 # Caminhos e constantes
 # --------------------------------------------------------------------------
@@ -71,6 +77,8 @@ CONFIG_PATH = BASE_DIR / "config.json"
 BACKUP_DIR = BASE_DIR / "Backup"
 
 ICON_PATH = RECURSOS_DIR / "assets" / "icon.ico"
+LOGO_ESCURA_PATH = RECURSOS_DIR / "assets" / "logo azul e preto.png"  # simbolo/marca em tons escuros, para fundos claros
+LOGO_CLARA_PATH = RECURSOS_DIR / "assets" / "logo azul e branco.png"  # mesma marca em tons claros, para fundos escuros
 
 ATTENTION_WINDOW_DAYS = 3  # janela (dias) para o indicador amarelo de "atencao"
 
@@ -142,6 +150,34 @@ def aplicar_icone_janela(janela):
             janela.iconbitmap(str(ICON_PATH))
         except tk.TclError:
             pass
+
+
+_cache_logos = {}  # (caminho, altura) -> PhotoImage; guarda a referencia viva para o Tk nao descartar a imagem
+
+
+def carregar_logo(caminho, altura):
+    """Carrega a logo do disco e redimensiona para a altura pedida, mantendo
+    a proporcao. Recorta a margem transparente ao redor antes de redimensionar,
+    para a marca aproveitar melhor o espaco quando exibida bem pequena."""
+    if not PIL_DISPONIVEL:
+        return None
+    chave = (str(caminho), altura)
+    if chave in _cache_logos:
+        return _cache_logos[chave]
+    if not caminho.exists():
+        return None
+    try:
+        imagem = _ImagemPIL.open(caminho)
+        caixa = imagem.getbbox()
+        if caixa:
+            imagem = imagem.crop(caixa)
+        largura = max(1, round(imagem.width * altura / imagem.height))
+        imagem = imagem.resize((largura, altura), _ImagemPIL.LANCZOS)
+        foto = _ImagemTk.PhotoImage(imagem)
+    except Exception:
+        return None
+    _cache_logos[chave] = foto
+    return foto
 
 
 def rotulo_titulo_versionado(mestre, texto, bg):
@@ -2364,9 +2400,12 @@ class TelaLogin(tk.Tk):
         for w in self.pad.winfo_children():
             w.destroy()
 
-        rotulo_titulo_versionado(self.pad, "Painel de Pendências", COR["surface"]).pack(anchor="w")
-        tk.Label(self.pad, text="Soto Company", font=FONTE_BASE,
-                 bg=COR["surface"], fg=COR["ink_muted"]).pack(anchor="center", fill="x", pady=(0, 14))
+        logo_login = carregar_logo(LOGO_ESCURA_PATH, 84)
+        if logo_login is not None:
+            tk.Label(self.pad, image=logo_login, bg=COR["surface"]).pack(anchor="center", pady=(0, 12))
+        rotulo_titulo_versionado(self.pad, "Painel de Pendências", COR["surface"]).pack(
+            anchor="center", pady=(0, 14)
+        )
 
         self._campo("Usuário", self.var_usuario)
         self._campo("Senha", self.var_senha, mostrar="*")
@@ -2481,7 +2520,7 @@ class App(tk.Tk):
     def __init__(self, usuario_atual):
         super().__init__()
         self.usuario_atual = usuario_atual
-        self.title(f"Painel de Pendências {APP_VERSION} — Compras de Componentes Eletrônicos")
+        self.title(f"Painel de Pendências {APP_VERSION}")
         self.configure(bg=COR["bg"])
         aplicar_icone_janela(self)
         self.geometry("1220x720")
@@ -2590,6 +2629,10 @@ class App(tk.Tk):
         sidebar = tk.Frame(self, bg=COR["acento_escuro"], width=90)
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
+
+        logo_sidebar = carregar_logo(LOGO_CLARA_PATH, 58)
+        if logo_sidebar is not None:
+            tk.Label(sidebar, image=logo_sidebar, bg=COR["acento_escuro"]).pack(pady=(20, 0))
 
         self.sidebar_botoes = {}
         opcoes = [
